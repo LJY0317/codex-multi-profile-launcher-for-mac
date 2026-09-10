@@ -11,7 +11,7 @@ jobs:
   test:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Run safety tests
         run: python3 -m unittest discover -s tests -v
       - name: Check shell syntax
