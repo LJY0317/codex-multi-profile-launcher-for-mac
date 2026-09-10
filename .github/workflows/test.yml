@@ -1,0 +1,20 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run safety tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Check shell syntax
+        run: for script in scripts/*.sh; do sh -n "$script"; done
+      - name: Compile Python sources
+        run: python3 -m py_compile src/codex_profile.py tests/test_safety.py
