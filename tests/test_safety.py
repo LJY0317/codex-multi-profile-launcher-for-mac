@@ -23,6 +23,12 @@ class SafetyTests(unittest.TestCase):
         self.home = Path(self.tmp.name)
         (self.home / "Applications").mkdir()
         (self.home / "Library/Application Support").mkdir(parents=True)
+        self.fake_app = self.home / "Official ChatGPT.app"
+        fake_executable = self.fake_app / "Contents/MacOS/ChatGPT"
+        fake_executable.parent.mkdir(parents=True)
+        fake_executable.touch()
+        self.app_patch = patch.object(module, "APP", self.fake_app)
+        self.app_patch.start()
         self.profile = module.Profile(self.home)
         for name in [".codex", "Library/Application Support/Codex"]:
             directory = self.home / name
@@ -44,6 +50,7 @@ class SafetyTests(unittest.TestCase):
             )
         self.running_patch.stop()
         self.fingerprint_patch.stop()
+        self.app_patch.stop()
         self.tmp.cleanup()
 
     def test_install_dry_run_remove_and_repeat(self):
