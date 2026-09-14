@@ -4,6 +4,8 @@ Run a second, isolated ChatGPT/Codex desktop profile on macOS without modifying 
 
 The launcher starts `/Applications/ChatGPT.app` with a separate `CODEX_HOME` and Electron/Chromium user-data directory. The official app remains the first profile, while `ChatGPT (2).app` provides a clean second profile with its own login.
 
+When both profiles must remain independently launchable, install the optional default-profile entry point with `scripts/install.sh install-default`. It creates `~/Applications/ChatGPT (1).app` with a distinct LaunchServices identifier and does not copy or modify the protected default profile. Pin that wrapper in the Dock in place of `/Applications/ChatGPT.app`; otherwise Dock clicks still target the official single bundle and cannot select a profile. The wrapper reuses only an exact default-profile process and refuses to start a duplicate when one is already running.
+
 > [!IMPORTANT]
 > This is an unofficial community project. It is not affiliated with, endorsed by, or supported by OpenAI. ChatGPT and Codex are trademarks of OpenAI.
 

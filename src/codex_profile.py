@@ -14,6 +14,7 @@ import sys
 
 
 IDENTIFIER = "local.codex-multi-profile-launcher.account2"
+DEFAULT_IDENTIFIER = "local.codex-multi-profile-launcher.account1"
 APP = Path("/Applications/ChatGPT.app")
 HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
 SOURCE = Path(__file__).resolve()
@@ -265,6 +266,104 @@ class Profile:
         print("Uninstalled. Official app and default profile were not targeted.")
 
 
+class DefaultProfileLauncher:
+    """A LaunchServices-visible entry point for the protected default profile."""
+
+    def __init__(self, home=HOME):
+        self.home = home
+        self.wrapper = home / "Applications/ChatGPT (1).app"
+        self.meta = home / "Library/Application Support/CodexMultiProfileLauncher"
+        self.manifest = self.meta / "default-install-manifest.json"
+
+    def install(self):
+        if self.wrapper.exists() or self.manifest.exists():
+            raise RuntimeError("Existing default launcher preserved; install refused")
+        if not self.wrapper.parent.is_dir() or not self.meta.is_dir():
+            raise RuntimeError("Create launcher parent directories first")
+        executable = APP / "Contents/MacOS/ChatGPT"
+        icon = APP / "Contents/Resources/electron.icns"
+        if not executable.is_file() or not icon.is_file():
+            raise RuntimeError("Official ChatGPT executable or icon missing")
+        resources = self.wrapper / "Contents/Resources"
+        macos = self.wrapper / "Contents/MacOS"
+        resources.mkdir(parents=True, mode=0o700)
+        macos.mkdir(mode=0o700)
+        shutil.copyfile(SOURCE, resources / "codex_profile.py")
+        shutil.copyfile(icon, resources / "icon.icns")
+        launcher = (
+            "#!/bin/sh\n"
+            "set -eu\n"
+            "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin\n"
+            "export PATH\n"
+            'exec python3 "$(dirname "$0")/../Resources/codex_profile.py" default-launch\n'
+        )
+        (macos / "launcher").write_text(launcher)
+        (macos / "launcher").chmod(0o755)
+        info = {
+            "CFBundleIdentifier": DEFAULT_IDENTIFIER,
+            "CFBundleDisplayName": "ChatGPT (1)",
+            "CFBundleName": "ChatGPT (1)",
+            "CFBundleExecutable": "launcher",
+            "CFBundleIconFile": "icon.icns",
+            "CFBundlePackageType": "APPL",
+            "CFBundleVersion": "1",
+            "CFBundleShortVersionString": "1.0",
+            "LSUIElement": True,
+        }
+        with (self.wrapper / "Contents/Info.plist").open("wb") as file:
+            plistlib.dump(info, file)
+        subprocess.run(
+            ["plutil", "-lint", str(self.wrapper / "Contents/Info.plist")],
+            check=True,
+        )
+        self.manifest.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "id": DEFAULT_IDENTIFIER,
+                    "wrapper": str(self.wrapper),
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        print("Installed:", self.wrapper)
+
+    def running(self):
+        rows = subprocess.check_output(["ps", "-axo", "pid=,args="], text=True)
+        executable = str(APP / "Contents/MacOS/ChatGPT")
+        result = []
+        for row in rows.splitlines():
+            fields = row.strip().split(None, 1)
+            if len(fields) != 2:
+                continue
+            command = fields[1]
+            if not (command == executable or command.startswith(executable + " ")):
+                continue
+            if not command[len(executable):].lstrip().startswith("--user-data-dir="):
+                result.append(int(fields[0]))
+        return result
+
+    def launch(self):
+        if self.running():
+            print("Default ChatGPT already running; no duplicate process started")
+            return
+        username = pwd.getpwuid(os.getuid()).pw_name
+        env = {
+            "HOME": str(self.home),
+            "USER": username,
+            "LOGNAME": username,
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin",
+            "LANG": "en_US.UTF-8",
+            "CODEX_HOME": str(self.home / ".codex"),
+        }
+        if os.environ.get("TMPDIR"):
+            env["TMPDIR"] = os.environ["TMPDIR"]
+        executable = str(APP / "Contents/MacOS/ChatGPT")
+        os.chdir(self.home)
+        os.execve(executable, [executable], env)
+
+
 def identity(path):
     stat = path.stat()
     return [stat.st_dev, stat.st_ino]
@@ -290,18 +389,24 @@ def main():
         return 1
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "command", choices=["install", "launch", "status", "uninstall"]
+        "command",
+        choices=["install", "launch", "status", "uninstall", "install-default", "default-launch"],
     )
     parser.add_argument(
         "--yes", action="store_true", help="Apply uninstall; default is dry run"
     )
     args = parser.parse_args()
-    profile = Profile()
+    if args.command in {"install-default", "default-launch"}:
+        profile = DefaultProfileLauncher()
+        command = "install" if args.command == "install-default" else "launch"
+    else:
+        profile = Profile()
+        command = args.command
     try:
-        if args.command == "uninstall":
+        if command == "uninstall":
             profile.uninstall(args.yes)
         else:
-            getattr(profile, args.command)()
+            getattr(profile, command)()
     except (
         OSError,
         ValueError,

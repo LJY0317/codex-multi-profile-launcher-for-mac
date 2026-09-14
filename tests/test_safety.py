@@ -23,7 +23,7 @@ class SafetyTests(unittest.TestCase):
         self.home = Path(self.tmp.name)
         (self.home / "Applications").mkdir()
         (self.home / "Library/Application Support").mkdir(parents=True)
-        self.fake_app = self.home / "Official ChatGPT.app"
+        self.fake_app = self.home / "OfficialChatGPT.app"
         fake_executable = self.fake_app / "Contents/MacOS/ChatGPT"
         fake_executable.parent.mkdir(parents=True)
         fake_executable.touch()
@@ -131,6 +131,25 @@ class SafetyTests(unittest.TestCase):
         )
         with self.assertRaises(RuntimeError):
             self.profile.install()
+
+    def test_default_launcher_has_its_own_bundle_and_never_reuses_account2(self):
+        self.profile.meta.mkdir()
+        default = module.DefaultProfileLauncher(self.home)
+        default.install()
+        info = (default.wrapper / "Contents/Info.plist").read_bytes()
+        self.assertIn(b"local.codex-multi-profile-launcher.account1", info)
+        self.assertTrue((default.wrapper / "Contents/Resources/icon.icns").exists())
+        self.assertNotIn("--user-data-dir=", (default.wrapper / "Contents/MacOS/launcher").read_text())
+
+    def test_default_running_ignores_account2_and_duplicate_default(self):
+        default = module.DefaultProfileLauncher(self.home)
+        executable = str(self.fake_app / "Contents/MacOS/ChatGPT")
+        rows = (
+            f"101 {executable} --user-data-dir={self.home}/account2\n"
+            f"202 {executable}\n"
+        )
+        with patch.object(module.subprocess, "check_output", return_value=rows):
+            self.assertEqual(default.running(), [202])
 
 
 if __name__ == "__main__":
