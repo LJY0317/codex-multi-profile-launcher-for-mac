@@ -143,13 +143,51 @@ class SafetyTests(unittest.TestCase):
 
     def test_default_running_ignores_account2_and_duplicate_default(self):
         default = module.DefaultProfileLauncher(self.home)
-        executable = str(self.fake_app / "Contents/MacOS/ChatGPT")
+        original_app = module.APP
+        module.APP = Path("/Applications/ChatGPT.app")
+        executable = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
         rows = (
-            f"101 {executable} --user-data-dir={self.home}/account2\n"
-            f"202 {executable}\n"
+            f"101 {executable} --other=1 --user-data-dir={self.home}/account2\n"
+            f"202 {executable} --other=1 --user-data-dir={self.home}/Library/Application Support/Codex\n"
+            f"303 {executable} --other=1\n"
+            f"404 {executable} --user-data-dir {self.home}/account2\n"
         )
-        with patch.object(module.subprocess, "check_output", return_value=rows):
-            self.assertEqual(default.running(), [202])
+        try:
+            with patch.object(module.subprocess, "check_output", return_value=rows):
+                self.assertEqual(default.running(), [202, 303])
+        finally:
+            module.APP = original_app
+
+    def test_default_running_process_activates_exact_pid(self):
+        default = module.DefaultProfileLauncher(self.home)
+        default.meta.mkdir()
+        process = {"pid": 202, "profile": "default", "command": "fixture"}
+        with patch.object(default, "_processes", return_value=[process]):
+            with patch.object(default, "_window_count_and_activate", return_value=1) as activate:
+                with patch.object(module.subprocess, "run") as run:
+                    default.launch()
+        activate.assert_called_once_with(202)
+        run.assert_not_called()
+
+    def test_default_running_without_window_reopens_and_rechecks_visibility(self):
+        default = module.DefaultProfileLauncher(self.home)
+        default.meta.mkdir()
+        process = {"pid": 202, "profile": "default", "command": "fixture"}
+        with patch.object(default, "_processes", side_effect=[[process], [process]]):
+            with patch.object(
+                default, "_window_count_and_activate", side_effect=[0, 1]
+            ) as activate:
+                with patch.object(default, "_visibility", return_value=(True, True)):
+                    with patch.object(
+                        module.subprocess,
+                        "run",
+                        return_value=module.subprocess.CompletedProcess([], 0),
+                    ) as run:
+                        default.launch()
+        self.assertEqual(activate.call_args_list[0].args, (202,))
+        self.assertEqual(
+            run.call_args.args[0][:3], ["/usr/bin/open", "-n", str(module.APP)]
+        )
 
 
 if __name__ == "__main__":

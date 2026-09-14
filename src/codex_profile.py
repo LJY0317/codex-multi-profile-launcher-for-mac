@@ -8,9 +8,11 @@ import os
 from pathlib import Path
 import plistlib
 import pwd
+import re
 import shutil
 import subprocess
 import sys
+import time
 
 
 IDENTIFIER = "local.codex-multi-profile-launcher.account2"
@@ -274,6 +276,8 @@ class DefaultProfileLauncher:
         self.wrapper = home / "Applications/ChatGPT (1).app"
         self.meta = home / "Library/Application Support/CodexMultiProfileLauncher"
         self.manifest = self.meta / "default-install-manifest.json"
+        self.data = home / "Library/Application Support/Codex"
+        self.trace = self.meta / "default-launch.log"
 
     def install(self):
         if self.wrapper.exists() or self.manifest.exists():
@@ -293,7 +297,7 @@ class DefaultProfileLauncher:
         launcher = (
             "#!/bin/sh\n"
             "set -eu\n"
-            "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin\n"
+            "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\n"
             "export PATH\n"
             'exec python3 "$(dirname "$0")/../Resources/codex_profile.py" default-launch\n'
         )
@@ -329,8 +333,51 @@ class DefaultProfileLauncher:
         )
         print("Installed:", self.wrapper)
 
+    def update(self):
+        if self.wrapper.is_symlink() or not self.wrapper.is_dir():
+            raise RuntimeError("Default launcher is missing or symlinked")
+        if not self.manifest.is_file() or self.manifest.is_symlink():
+            raise RuntimeError("Default launcher manifest missing or symlinked")
+        manifest = json.loads(self.manifest.read_text())
+        if (
+            manifest.get("schema") != 1
+            or manifest.get("id") != DEFAULT_IDENTIFIER
+            or manifest.get("wrapper") != str(self.wrapper)
+        ):
+            raise RuntimeError("Unknown default launcher manifest")
+        backup_root = self.meta / "backups" / (
+            "chatgpt1-" + time.strftime("%Y%m%d-%H%M%S")
+        )
+        backup_root.parent.mkdir(mode=0o700, exist_ok=True)
+        shutil.copytree(self.wrapper, backup_root)
+        resources = self.wrapper / "Contents/Resources"
+        macos = self.wrapper / "Contents/MacOS"
+        if not (resources.is_dir() and macos.is_dir()):
+            raise RuntimeError("Default launcher layout is incomplete")
+        shutil.copyfile(SOURCE, resources / "codex_profile.py")
+        launcher = macos / "launcher"
+        launcher.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\n"
+            "export PATH\n"
+            'exec python3 "$(dirname "$0")/../Resources/codex_profile.py" default-launch\n'
+        )
+        launcher.chmod(0o755)
+        manifest["source_sha256"] = hashlib.sha256(SOURCE.read_bytes()).hexdigest()
+        manifest["backup"] = str(backup_root)
+        temporary = self.meta / "default-install-manifest.tmp"
+        temporary.write_text(json.dumps(manifest, indent=2) + "\n")
+        os.replace(temporary, self.manifest)
+        print("Updated:", self.wrapper)
+        print("Backup:", backup_root)
+
     def running(self):
-        rows = subprocess.check_output(["ps", "-axo", "pid=,args="], text=True)
+        return [process["pid"] for process in self._processes() if process["profile"] == "default"]
+
+    def _processes(self):
+        """Return only official ChatGPT main processes with classified data paths."""
+        rows = subprocess.check_output(["/bin/ps", "-axo", "pid=,args="], text=True)
         executable = str(APP / "Contents/MacOS/ChatGPT")
         result = []
         for row in rows.splitlines():
@@ -340,28 +387,153 @@ class DefaultProfileLauncher:
             command = fields[1]
             if not (command == executable or command.startswith(executable + " ")):
                 continue
-            if not command[len(executable):].lstrip().startswith("--user-data-dir="):
-                result.append(int(fields[0]))
+            remainder = command[len(executable):].lstrip()
+            user_data = []
+            for match in re.finditer(
+                r"(?<!\S)--user-data-dir(?:=|\s|$)", remainder
+            ):
+                value = remainder[match.end():]
+                next_flag = re.search(r"\s--[A-Za-z0-9][A-Za-z0-9_-]*(?:=|\s|$)", value)
+                if next_flag:
+                    value = value[:next_flag.start()]
+                user_data.append(value.strip() or None)
+            profile = "unknown"
+            if len(user_data) == 0:
+                profile = "default"
+            elif len(user_data) == 1 and user_data[0] == str(self.data):
+                profile = "default"
+            elif len(user_data) == 1 and user_data[0]:
+                profile = "other"
+            result.append(
+                {"pid": int(fields[0]), "profile": profile, "command": command}
+            )
         return result
 
+    def _record(self, stage, **fields):
+        self.meta.mkdir(mode=0o700, exist_ok=True)
+        safe_fields = {"stage": stage, "pid": os.getpid(), **fields}
+        with self.trace.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(safe_fields, sort_keys=True) + "\n")
+
+    def _window_count_and_activate(self, pid):
+        script = (
+            'tell application "System Events"\n'
+            f"set p to first application process whose unix id is {pid}\n"
+            "set frontmost of p to true\n"
+            "return count of windows of p\n"
+            "end tell"
+        )
+        result = subprocess.run(
+            ["/usr/bin/osascript", "-e", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if result.returncode != 0:
+            raise RuntimeError("Account1 window probe failed")
+        try:
+            return int(result.stdout.strip())
+        except ValueError as error:
+            raise RuntimeError("Account1 window probe returned invalid data") from error
+
+    def _visibility(self, pid):
+        info = subprocess.run(
+            ["/usr/bin/lsappinfo", "info", "-pid", str(pid)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if info.returncode != 0:
+            return False, False
+        asn = re.search(r"ASN:0x[0-9a-f]+-0x[0-9a-f]+-\"[^\"]+\"", info.stdout)
+        if not asn:
+            return False, False
+        visible = subprocess.run(
+            ["/usr/bin/lsappinfo", "visibleProcessList"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if visible.returncode != 0:
+            return False, False
+        index = visible.stdout.find(asn.group(0))
+        return index >= 0, index == 0
+
+    def _reopen_existing(self):
+        result = subprocess.run(
+            [
+                "/usr/bin/open",
+                "-n",
+                str(APP),
+                "--args",
+                "--user-data-dir=" + str(self.data),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError("Account1 reopen request failed")
+        for _ in range(15):
+            processes = self._processes()
+            defaults = [p for p in processes if p["profile"] == "default"]
+            if len(defaults) == 1:
+                visible, frontmost = self._visibility(defaults[0]["pid"])
+                if visible and frontmost:
+                    return defaults[0]["pid"]
+            if len(defaults) > 1:
+                raise RuntimeError("Multiple Account1 processes after reopen")
+            time.sleep(0.2)
+        raise RuntimeError("Account1 reopen did not produce a visible window")
+
     def launch(self):
-        if self.running():
-            print("Default ChatGPT already running; no duplicate process started")
+        self._record("wrapper_entry")
+        processes = self._processes()
+        defaults = [p for p in processes if p["profile"] == "default"]
+        unknown = [p for p in processes if p["profile"] == "unknown"]
+        if unknown:
+            self._record("unknown_process_ignored", pids=[p["pid"] for p in unknown])
+        if len(defaults) > 1:
+            self._record("duplicate_default_process", pids=[p["pid"] for p in defaults])
+            raise RuntimeError("Multiple Account1 processes; refusing to select one")
+        if defaults:
+            pid = defaults[0]["pid"]
+            self._record("account1_process_found", target_pid=pid)
+            try:
+                windows = self._window_count_and_activate(pid)
+                self._record("account1_window_probe", target_pid=pid, windows=windows)
+                if windows > 0:
+                    print("Account1 window activated:", pid)
+                    return
+            except (RuntimeError, subprocess.TimeoutExpired):
+                self._record("account1_window_probe_error", target_pid=pid)
+            reopened = self._reopen_existing()
+            self._record("account1_window_reopened", target_pid=reopened)
+            print("Account1 window reopened:", reopened)
             return
         username = pwd.getpwuid(os.getuid()).pw_name
         env = {
             "HOME": str(self.home),
             "USER": username,
             "LOGNAME": username,
-            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin",
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
             "LANG": "en_US.UTF-8",
             "CODEX_HOME": str(self.home / ".codex"),
+            "CODEX_ELECTRON_USER_DATA_PATH": str(self.data),
         }
         if os.environ.get("TMPDIR"):
             env["TMPDIR"] = os.environ["TMPDIR"]
         executable = str(APP / "Contents/MacOS/ChatGPT")
+        self._record("execve_start", executable=executable)
         os.chdir(self.home)
-        os.execve(executable, [executable], env)
+        try:
+            os.execve(executable, [executable, "--user-data-dir=" + str(self.data)], env)
+        except OSError as error:
+            self._record("execve_error", errno=error.errno, error_type=type(error).__name__)
+            raise
 
 
 def identity(path):
@@ -390,15 +562,22 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
-        choices=["install", "launch", "status", "uninstall", "install-default", "default-launch"],
+        choices=[
+            "install", "launch", "status", "uninstall",
+            "install-default", "update-default", "default-launch",
+        ],
     )
     parser.add_argument(
         "--yes", action="store_true", help="Apply uninstall; default is dry run"
     )
     args = parser.parse_args()
-    if args.command in {"install-default", "default-launch"}:
+    if args.command in {"install-default", "update-default", "default-launch"}:
         profile = DefaultProfileLauncher()
-        command = "install" if args.command == "install-default" else "launch"
+        command = {
+            "install-default": "install",
+            "update-default": "update",
+            "default-launch": "launch",
+        }[args.command]
     else:
         profile = Profile()
         command = args.command
