@@ -95,6 +95,9 @@ class Profile:
         executable = APP / "Contents/MacOS/ChatGPT"
         if not executable.is_file():
             raise RuntimeError("Official ChatGPT executable missing")
+        icon = APP / "Contents/Resources/electron.icns"
+        if not icon.is_file():
+            raise RuntimeError("Official ChatGPT icon missing")
 
         baseline = fingerprint()
         self.meta.mkdir(mode=0o700)
@@ -121,6 +124,8 @@ class Profile:
         resources.mkdir(parents=True)
         macos.mkdir()
         shutil.copyfile(SOURCE, resources / "codex_profile.py")
+        # Reuse the installed official app icon; do not alter its bundle.
+        shutil.copyfile(icon, resources / "icon.icns")
         launcher = (
             "#!/bin/sh\n"
             "set -eu\n"
@@ -136,6 +141,7 @@ class Profile:
             "CFBundleDisplayName": "ChatGPT (2)",
             "CFBundleName": "ChatGPT (2)",
             "CFBundleExecutable": "launcher",
+            "CFBundleIconFile": "icon.icns",
             "CFBundlePackageType": "APPL",
             "CFBundleVersion": "1",
             "CFBundleShortVersionString": "1.0",

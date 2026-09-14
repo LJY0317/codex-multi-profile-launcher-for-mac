@@ -27,6 +27,9 @@ class SafetyTests(unittest.TestCase):
         fake_executable = self.fake_app / "Contents/MacOS/ChatGPT"
         fake_executable.parent.mkdir(parents=True)
         fake_executable.touch()
+        fake_icon = self.fake_app / "Contents/Resources/electron.icns"
+        fake_icon.parent.mkdir(parents=True)
+        fake_icon.write_bytes(b"official-icon-fixture")
         self.app_patch = patch.object(module, "APP", self.fake_app)
         self.app_patch.start()
         self.profile = module.Profile(self.home)
@@ -62,6 +65,10 @@ class SafetyTests(unittest.TestCase):
         ).read_text()
         self.assertIn("exec python3", launcher)
         self.assertNotIn(str(Path.home()), launcher)
+        self.assertEqual(
+            (self.profile.wrapper / "Contents/Resources/icon.icns").read_bytes(),
+            b"official-icon-fixture",
+        )
         self.profile.uninstall()
         self.assertTrue(self.profile.wrapper.exists())
         # An internal symlink must not cause target deletion.
