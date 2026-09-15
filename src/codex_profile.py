@@ -12,11 +12,15 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
 
 
 IDENTIFIER = "local.codex-multi-profile-launcher.account2"
 DEFAULT_IDENTIFIER = "local.codex-multi-profile-launcher.account1"
+MANIFEST_SCHEMA = 2
+LEGACY_MANIFEST_SCHEMA = 1
 APP = Path("/Applications/ChatGPT.app")
 HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
 SOURCE = Path(__file__).resolve()
@@ -30,6 +34,7 @@ class Profile:
         self.data = home / "Library/Application Support/Codex-Account2"
         self.meta = home / "Library/Application Support/CodexMultiProfileLauncher"
         self.manifest = self.meta / "install-manifest.json"
+        self.legacy_backup = self.meta / "install-manifest.schema1-backup.json"
         self.paths = [self.wrapper, self.codex, self.data]
         self.protected = [
             APP,
@@ -58,31 +63,123 @@ class Profile:
             raise RuntimeError("Expected an owned directory: " + str(path))
 
     def save(self, manifest):
-        temporary = self.meta / "manifest.tmp"
-        with temporary.open("x") as file:
-            json.dump(manifest, file, indent=2)
-            file.write("\n")
-        os.replace(temporary, self.manifest)
+        atomic_write_json(self.manifest, manifest)
 
-    def load(self):
+    def _read_manifest(self):
         self.safe(self.meta)
-        if self.manifest.is_symlink():
-            raise RuntimeError("Symlink manifest refused")
+        if not self.manifest.is_file() or self.manifest.is_symlink():
+            raise RuntimeError("Install manifest missing or symlinked")
         manifest = json.loads(self.manifest.read_text())
-        if manifest.get("schema") != 1 or manifest.get("id") != IDENTIFIER:
+        if manifest.get("id") != IDENTIFIER:
             raise RuntimeError("Unknown manifest")
-        if manifest.get("meta_identity") != identity(self.meta):
-            raise RuntimeError("Metadata directory identity changed")
+        return manifest
+
+    def _validate_entries(self, manifest, identity_kind):
         seen = set()
-        for entry in manifest["created"]:
+        entries = manifest.get("created")
+        if not isinstance(entries, list):
+            raise RuntimeError("Invalid manifest entries")
+        for entry in entries:
+            if not isinstance(entry, dict) or "path" not in entry or "identity" not in entry:
+                raise RuntimeError("Invalid manifest entry")
             path = Path(entry["path"])
             self.safe(path)
             if path not in self.paths or str(path) in seen:
                 raise RuntimeError("Invalid or duplicate manifest entry")
             seen.add(str(path))
+            if not identity_kind(entry["identity"]):
+                raise RuntimeError("Invalid directory identity")
+        if seen != set(map(str, self.paths)):
+            raise RuntimeError("Manifest path set is incomplete")
+
+    def load(self):
+        manifest = self._read_manifest()
+        if manifest.get("schema") == LEGACY_MANIFEST_SCHEMA:
+            raise RuntimeError(
+                "Legacy install manifest requires explicit identity recovery; "
+                "run recover-identity before launch"
+            )
+        if manifest.get("schema") != MANIFEST_SCHEMA:
+            raise RuntimeError("Unknown manifest")
+        if not stable_identity_value(manifest.get("meta_identity")):
+            raise RuntimeError("Invalid metadata directory identity")
+        if manifest.get("meta_identity") != identity(self.meta):
+            raise RuntimeError("Metadata directory identity changed")
+        self._validate_entries(manifest, stable_identity_value)
+        for entry in manifest["created"]:
+            path = Path(entry["path"])
             if path.exists() and identity(path) != entry["identity"]:
                 raise RuntimeError("Directory replaced; preserving: " + str(path))
         return manifest
+
+    def recover_identity(self, adopt_current_volume=False):
+        manifest = self._read_manifest()
+        if manifest.get("schema") == MANIFEST_SCHEMA:
+            self.load()
+            print("Install manifest already uses APFS Volume UUID + inode identities")
+            return
+        if manifest.get("schema") != LEGACY_MANIFEST_SCHEMA:
+            raise RuntimeError("Unknown manifest")
+        if not legacy_identity_value(manifest.get("meta_identity")):
+            raise RuntimeError("Invalid legacy metadata identity")
+        self._validate_entries(manifest, legacy_identity_value)
+        if manifest.get("ready") is not True:
+            raise RuntimeError("Legacy installation is incomplete; refusing recovery")
+
+        legacy_identities = [manifest["meta_identity"]] + [
+            entry["identity"] for entry in manifest["created"]
+        ]
+        if len({value[0] for value in legacy_identities}) != 1:
+            raise RuntimeError("Legacy manifest recorded multiple devices; refusing recovery")
+
+        current = {str(self.meta): identity(self.meta)}
+        if self.meta.stat().st_ino != manifest["meta_identity"][1]:
+            raise RuntimeError("Metadata directory inode changed; refusing recovery")
+        for entry in manifest["created"]:
+            path = Path(entry["path"])
+            if not path.is_dir():
+                raise RuntimeError("Managed directory missing; refusing recovery: " + str(path))
+            if path.stat().st_ino != entry["identity"][1]:
+                raise RuntimeError("Directory inode changed; refusing recovery: " + str(path))
+            current[str(path)] = identity(path)
+
+        volume_uuids = {value["volume_uuid"] for value in current.values()}
+        if len(volume_uuids) != 1:
+            raise RuntimeError("Managed paths are on different APFS volumes; refusing recovery")
+        volume_uuid_value = next(iter(volume_uuids))
+
+        print("Legacy inode continuity verified for metadata and all managed directories")
+        print("Current APFS Volume UUID:", volume_uuid_value)
+        print(
+            "Legacy manifest has no Volume UUID, so prior-volume continuity "
+            "cannot be proven from that record"
+        )
+        if not adopt_current_volume:
+            print(
+                "Dry run only. Re-run recover-identity with --adopt-current-volume "
+                "to explicitly adopt this verified current volume"
+            )
+            return
+
+        legacy_bytes = self.manifest.read_bytes()
+        create_backup_once(self.legacy_backup, legacy_bytes)
+        migrated = dict(manifest)
+        migrated["schema"] = MANIFEST_SCHEMA
+        migrated["meta_identity"] = current[str(self.meta)]
+        migrated["created"] = [
+            {"path": entry["path"], "identity": current[entry["path"]]}
+            for entry in manifest["created"]
+        ]
+        migrated["identity_migration"] = {
+            "from_schema": LEGACY_MANIFEST_SCHEMA,
+            "legacy_backup": self.legacy_backup.name,
+            "legacy_volume_uuid_available": False,
+            "recovery": "explicit-current-volume-adoption",
+        }
+        self.save(migrated)
+        self.load()
+        print("Recovered install manifest:", self.manifest)
+        print("Legacy manifest backup:", self.legacy_backup)
 
     def install(self):
         for path in self.paths + [self.meta]:
@@ -105,7 +202,7 @@ class Profile:
         baseline = fingerprint()
         self.meta.mkdir(mode=0o700)
         manifest = {
-            "schema": 1,
+            "schema": MANIFEST_SCHEMA,
             "id": IDENTIFIER,
             "meta_identity": identity(self.meta),
             "created": [],
@@ -536,9 +633,150 @@ class DefaultProfileLauncher:
             raise
 
 
+def stable_identity_value(value):
+    if not isinstance(value, dict) or set(value) != {"volume_uuid", "inode"}:
+        return False
+    try:
+        uuid.UUID(value["volume_uuid"])
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return isinstance(value["inode"], int) and value["inode"] > 0
+
+
+def legacy_identity_value(value):
+    return (
+        isinstance(value, list)
+        and len(value) == 2
+        and all(isinstance(part, int) and part >= 0 for part in value)
+        and value[1] > 0
+    )
+
+
+def volume_uuid(path):
+    try:
+        df = subprocess.check_output(
+            ["/bin/df", "-P", str(path)],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        lines = [line for line in df.splitlines() if line.strip()]
+        if len(lines) < 2:
+            raise RuntimeError("Filesystem identity lookup returned no mount data")
+        device = lines[-1].split()[0]
+        if not device.startswith("/dev/"):
+            raise RuntimeError("Managed path is not on a local disk volume")
+        output = subprocess.check_output(
+            ["/usr/sbin/diskutil", "info", "-plist", device],
+            stderr=subprocess.DEVNULL,
+        )
+        info = plistlib.loads(output)
+    except (OSError, plistlib.InvalidFileException, subprocess.SubprocessError) as error:
+        raise RuntimeError("APFS volume identity lookup failed") from error
+    if info.get("FilesystemType") != "apfs":
+        raise RuntimeError("Managed path is not on APFS")
+    value = info.get("VolumeUUID")
+    try:
+        return str(uuid.UUID(value)).upper()
+    except (AttributeError, TypeError, ValueError) as error:
+        raise RuntimeError("APFS Volume UUID unavailable") from error
+
+
 def identity(path):
     stat = path.stat()
-    return [stat.st_dev, stat.st_ino]
+    return {"volume_uuid": volume_uuid(path), "inode": stat.st_ino}
+
+
+def _fsync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def atomic_write_bytes(path, data):
+    descriptor, temporary = tempfile.mkstemp(
+        prefix="." + path.name + ".",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary_path = Path(temporary)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as file:
+            file.write(data)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary_path, path)
+        _fsync_directory(path.parent)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def atomic_write_json(path, value):
+    data = (json.dumps(value, indent=2) + "\n").encode()
+    atomic_write_bytes(path, data)
+
+
+def create_backup_once(path, data):
+    if path.is_symlink():
+        raise RuntimeError("Symlink legacy manifest backup refused")
+    if path.exists():
+        if not path.is_file() or path.read_bytes() != data:
+            raise RuntimeError("Legacy manifest backup already exists with different contents")
+        return
+
+    descriptor, temporary = tempfile.mkstemp(
+        prefix="." + path.name + ".",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary_path = Path(temporary)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as file:
+            file.write(data)
+            file.flush()
+            os.fsync(file.fileno())
+        try:
+            os.link(temporary_path, path)
+        except FileExistsError:
+            if path.is_symlink() or not path.is_file() or path.read_bytes() != data:
+                raise RuntimeError(
+                    "Legacy manifest backup appeared with different contents"
+                )
+        _fsync_directory(path.parent)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def show_account2_launch_error(error):
+    detail = " ".join(str(error).split())[:240]
+    message = (
+        "ChatGPT (2) / Account2를 시작하지 못했습니다.\n\n"
+        "설치 경로 검증이 필요합니다. 프로젝트에서 "
+        "scripts/recover-identity.sh로 확인한 뒤 필요한 경우 "
+        "--adopt-current-volume으로 명시 복구하세요.\n\n"
+        "오류: " + detail
+    )
+    script = (
+        'on run argv\n'
+        'display alert "ChatGPT (2) 실행 실패" message (item 1 of argv) '
+        'as critical buttons {"확인"} default button "확인"\n'
+        'end run'
+    )
+    try:
+        subprocess.run(
+            ["/usr/bin/osascript", "-e", script, message],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 def fingerprint():
@@ -563,12 +801,17 @@ def main():
     parser.add_argument(
         "command",
         choices=[
-            "install", "launch", "status", "uninstall",
+            "install", "launch", "status", "uninstall", "recover-identity",
             "install-default", "update-default", "default-launch",
         ],
     )
     parser.add_argument(
         "--yes", action="store_true", help="Apply uninstall; default is dry run"
+    )
+    parser.add_argument(
+        "--adopt-current-volume",
+        action="store_true",
+        help="Explicitly adopt the currently verified APFS volume during legacy recovery",
     )
     args = parser.parse_args()
     if args.command in {"install-default", "update-default", "default-launch"}:
@@ -584,6 +827,8 @@ def main():
     try:
         if command == "uninstall":
             profile.uninstall(args.yes)
+        elif command == "recover-identity":
+            profile.recover_identity(args.adopt_current_volume)
         else:
             getattr(profile, command)()
     except (
@@ -594,6 +839,8 @@ def main():
         subprocess.SubprocessError,
     ) as error:
         print("Error:", error, file=sys.stderr)
+        if args.command == "launch":
+            show_account2_launch_error(error)
         return 1
     return 0
 

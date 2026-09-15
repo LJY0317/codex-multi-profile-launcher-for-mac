@@ -1,6 +1,8 @@
 """Safety tests that never touch real ChatGPT or Codex profile data."""
 
 import importlib.util
+import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -13,6 +15,9 @@ spec = importlib.util.spec_from_file_location(
 )
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
+
+VOLUME_A = "11111111-2222-4333-8444-555555555555"
+VOLUME_B = "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE"
 
 
 class SafetyTests(unittest.TestCase):
@@ -41,6 +46,10 @@ class SafetyTests(unittest.TestCase):
             module, "fingerprint", return_value={"fixture": "unchanged"}
         )
         self.fingerprint_patch.start()
+        self.volume_uuid_patch = patch.object(
+            module, "volume_uuid", return_value=VOLUME_A
+        )
+        self.volume_uuid_patch.start()
         self.running_patch = patch.object(
             module.Profile, "running", return_value=[]
         )
@@ -52,9 +61,27 @@ class SafetyTests(unittest.TestCase):
                 (self.home / name / "sentinel").read_text(), "original"
             )
         self.running_patch.stop()
+        self.volume_uuid_patch.stop()
         self.fingerprint_patch.stop()
         self.app_patch.stop()
         self.tmp.cleanup()
+
+    def make_legacy_manifest(self, legacy_device=987654321):
+        self.profile.install()
+        current = self.profile.load()
+        legacy = dict(current)
+        legacy["schema"] = module.LEGACY_MANIFEST_SCHEMA
+        legacy["meta_identity"] = [legacy_device, self.profile.meta.stat().st_ino]
+        legacy["created"] = [
+            {
+                "path": entry["path"],
+                "identity": [legacy_device, Path(entry["path"]).stat().st_ino],
+            }
+            for entry in current["created"]
+        ]
+        legacy.pop("identity_migration", None)
+        self.profile.save(legacy)
+        return self.profile.manifest.read_bytes()
 
     def test_install_dry_run_remove_and_repeat(self):
         self.profile.install()
@@ -131,6 +158,115 @@ class SafetyTests(unittest.TestCase):
         )
         with self.assertRaises(RuntimeError):
             self.profile.install()
+
+    def test_owner_mismatch_refused(self):
+        self.profile.install()
+        original_stat = Path.stat
+
+        def wrong_owner(path, *args, **kwargs):
+            result = original_stat(path, *args, **kwargs)
+            if path == self.profile.codex:
+                values = list(result)
+                values[4] = os.getuid() + 1
+                return os.stat_result(values)
+            return result
+
+        with patch.object(Path, "stat", wrong_owner):
+            with self.assertRaises(RuntimeError):
+                self.profile.safe(self.profile.codex)
+
+    def test_manifest_identity_uses_volume_uuid_and_inode_without_device(self):
+        self.profile.install()
+        manifest = self.profile.load()
+        identities = [manifest["meta_identity"]] + [
+            entry["identity"] for entry in manifest["created"]
+        ]
+        for value in identities:
+            self.assertEqual(set(value), {"volume_uuid", "inode"})
+            self.assertEqual(value["volume_uuid"], VOLUME_A)
+
+    def test_volume_uuid_change_refused(self):
+        self.profile.install()
+        with patch.object(module, "volume_uuid", return_value=VOLUME_B):
+            with self.assertRaises(RuntimeError):
+                self.profile.load()
+
+    def test_identity_lookup_failure_refused_without_fallback(self):
+        self.profile.install()
+        before = self.profile.manifest.read_bytes()
+        with patch.object(
+            module, "volume_uuid", side_effect=RuntimeError("fixture lookup failed")
+        ):
+            with self.assertRaises(RuntimeError):
+                self.profile.load()
+        self.assertEqual(self.profile.manifest.read_bytes(), before)
+
+    def test_legacy_device_change_requires_explicit_recovery_then_succeeds(self):
+        legacy_bytes = self.make_legacy_manifest()
+        with self.assertRaises(RuntimeError):
+            self.profile.load()
+
+        self.profile.recover_identity()
+        self.assertEqual(self.profile.manifest.read_bytes(), legacy_bytes)
+        self.assertFalse(self.profile.legacy_backup.exists())
+
+        self.profile.recover_identity(True)
+        migrated = self.profile.load()
+        self.assertEqual(migrated["schema"], module.MANIFEST_SCHEMA)
+        self.assertEqual(self.profile.legacy_backup.read_bytes(), legacy_bytes)
+        self.assertFalse(
+            any(
+                identity.get("volume_uuid") != VOLUME_A
+                for identity in [migrated["meta_identity"]]
+                + [entry["identity"] for entry in migrated["created"]]
+            )
+        )
+
+        backup_after_first_recovery = self.profile.legacy_backup.read_bytes()
+        self.profile.recover_identity(True)
+        self.assertEqual(
+            self.profile.legacy_backup.read_bytes(), backup_after_first_recovery
+        )
+
+    def test_legacy_inode_change_refused(self):
+        self.make_legacy_manifest()
+        manifest = json.loads(self.profile.manifest.read_text())
+        manifest["created"][1]["identity"][1] += 1
+        self.profile.save(manifest)
+        with self.assertRaises(RuntimeError):
+            self.profile.recover_identity(True)
+        self.assertFalse(self.profile.legacy_backup.exists())
+
+    def test_legacy_recovery_refuses_paths_on_different_current_volumes(self):
+        self.make_legacy_manifest()
+
+        def split_volume(path):
+            return VOLUME_B if path == self.profile.data else VOLUME_A
+
+        with patch.object(module, "volume_uuid", side_effect=split_volume):
+            with self.assertRaises(RuntimeError):
+                self.profile.recover_identity(True)
+        self.assertFalse(self.profile.legacy_backup.exists())
+
+    def test_atomic_manifest_save_ignores_stale_temp_file(self):
+        self.profile.install()
+        stale = self.profile.meta / ".install-manifest.json.stale.tmp"
+        stale.write_text("interrupted")
+        manifest = self.profile.load()
+        self.profile.save(manifest)
+        self.assertEqual(self.profile.load(), manifest)
+
+    def test_launch_error_dialog_is_short_and_actionable(self):
+        with patch.object(module.subprocess, "run") as run:
+            module.show_account2_launch_error(
+                RuntimeError("Metadata directory identity changed")
+            )
+        message = run.call_args.args[0][-1]
+        self.assertIn("ChatGPT (2) / Account2", message)
+        self.assertIn("recover-identity.sh", message)
+        self.assertIn("--adopt-current-volume", message)
+        self.assertNotIn("Traceback", message)
+        self.assertLess(len(message), 600)
 
     def test_default_launcher_has_its_own_bundle_and_never_reuses_account2(self):
         self.profile.meta.mkdir()

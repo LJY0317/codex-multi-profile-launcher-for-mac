@@ -47,6 +47,20 @@ Check the installation at any time:
 ./scripts/status.sh
 ```
 
+Older schema-1 installs recorded the kernel device number (`st_dev`), which can
+change across macOS boots. Inspect a legacy install without changing it:
+
+```sh
+./scripts/recover-identity.sh
+```
+
+If the recorded inodes still match, all paths pass the ownership/symlink
+checks, and they are currently on one APFS volume, recovery can be applied
+explicitly with `./scripts/recover-identity.sh --adopt-current-volume`. The old
+manifest is backed up before the atomic schema update. Because schema 1 did not
+record a volume UUID, this explicit recovery does not claim that the old and
+current volume UUIDs were proven identical.
+
 You can also launch it from a terminal:
 
 ```sh
@@ -89,7 +103,11 @@ The installed wrapper looks for `python3` in the standard Homebrew and system co
 - Fixed allowlist for every managed path
 - Explicit protected paths for the official app and default profile
 - Empty second profile; no credential migration code
-- Per-directory device/inode identities recorded in the manifest
+- Per-directory APFS Volume UUID + inode identities recorded in the manifest
+- The UUID is the APFS volume's `VolumeUUID` (not the transient `/dev/disk*`
+  identifier, APFS container UUID, or physical-store identifier)
+- Legacy device/inode manifests require explicit recovery; lookup failures never
+  fall back to device-only or inode-only acceptance
 - Dry-run uninstall by default
 - No background service, login item, updater, or telemetry
 - Official app core-file fingerprints recorded for status diagnostics

@@ -40,6 +40,20 @@ open "$HOME/Applications/ChatGPT (2).app"
 ./scripts/launch.sh
 ```
 
+구형 schema 1 설치 기록은 재부팅 사이에 바뀔 수 있는 커널 장치 번호
+(`st_dev`)를 저장했습니다. 변경 없이 먼저 검사하려면:
+
+```sh
+./scripts/recover-identity.sh
+```
+
+기존 inode가 모두 일치하고 소유자·symlink 검사를 통과하며 현재 한 APFS
+볼륨에 있다는 것이 확인된 경우에만
+`./scripts/recover-identity.sh --adopt-current-volume`로 명시적으로 복구할 수
+있습니다. 기존 manifest는 먼저 백업되고 새 manifest는 원자적으로
+저장됩니다. schema 1에는 과거 볼륨 UUID가 없으므로 이 절차가 과거와 현재
+볼륨 UUID의 동일성을 증명한다고 주장하지 않습니다.
+
 실행 중인 실제 창이나 Dock 표시는 공식 앱의 이름과 아이콘으로 보일 수 있습니다.
 
 ## 제거와 원복
@@ -65,6 +79,11 @@ open "$HOME/Applications/ChatGPT (2).app"
 두 프로필의 `CODEX_HOME` 또는 user-data 경로를 공유하거나 symlink로 연결하지 마세요. 계정 사이에서 작업을 이어갈 때는 프로젝트 파일과 인계 문서를 공유하고, 동시 작업은 별도 Git worktree를 사용하는 편이 안전합니다.
 
 런처는 Homebrew 및 macOS의 표준 명령 경로에서 `python3`를 찾습니다. Python 3가 제거되면 다시 설치하거나, 현재 Python 3로 `src/codex_profile.py launch`를 실행하세요.
+
+관리 경로 식별에는 해당 경로가 실제로 올라간 APFS 볼륨의 `VolumeUUID`와
+inode를 함께 사용합니다. 재부팅 때 바뀔 수 있는 `/dev/disk*` 번호나
+`st_dev`, APFS container/physical-store UUID를 영구 식별자로 사용하지
+않습니다. UUID 조회에 실패하면 실행을 허용하는 fallback은 없습니다.
 
 ## 개발 및 검증
 
