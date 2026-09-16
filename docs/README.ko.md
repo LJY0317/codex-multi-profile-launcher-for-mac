@@ -3,6 +3,7 @@
 공식 `/Applications/ChatGPT.app`을 수정하거나 복제하지 않고, 서로 격리된 두 번째 ChatGPT/Codex 데스크톱 프로필을 실행하는 macOS용 런처입니다.
 
 공식 앱은 기존 계정에 그대로 사용하고, `ChatGPT (2).app`은 별도의 `CODEX_HOME`과 Electron/Chromium 데이터 디렉터리에서 새 계정으로 로그인합니다.
+두 프로필은 같은 보호된 `/Applications/ChatGPT.app` 바이너리를 실행하고 프로필 상태만 분리합니다. 따라서 공식 앱을 한 번 업데이트하면 다음 실행부터 두 프로필 모두 같은 새 앱 바이너리를 사용합니다.
 
 > [!IMPORTANT]
 > OpenAI가 제작·보증·지원하는 제품이 아닌 비공식 커뮤니티 프로젝트입니다. ChatGPT와 Codex는 OpenAI의 상표입니다.
